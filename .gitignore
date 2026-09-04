@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Envs
+.venv/
+venv/
+.env
+
+# Test artifacts
+.pytest_cache/
+.mypy_cache/
+.coverage
+
+# Statement fixtures — real bank PDFs, never commit
+backend/tests/fixtures/*.pdf
+
+# OS
+.DS_Store
