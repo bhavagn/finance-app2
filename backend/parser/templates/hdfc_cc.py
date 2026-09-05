@@ -4,23 +4,34 @@ Pure function: a PDF path in, a list of canonical `Transaction` models out. No D
 network calls. `statement_id`/`account_id`/`user_id`/`fingerprint` are left for the pipeline/DB to
 attach — this template only knows what's on the page.
 
-UNVERIFIED against a real fixture at the time this was written: no Millennia PDF was available.
-Coordinate/label assumptions below are best-effort, mirroring how the savings parser's column x1
-ranges started as guesses and were recalibrated once the real PDF arrived (see hdfc_savings.py's
-git history) — expect this module to need the same treatment.
+Verified against the real HDFC Millennia ••9670 fixtures (Jun/Jul/Aug 2026 statements). Two
+assumptions this module started with turned out wrong on real data and were corrected here:
+- The credit indicator is NOT a trailing "Cr"/"CR" suffix — real rows use a standalone "+" word
+  immediately before the "C" currency glyph (e.g. "PETRO SURCHARGE WAIVER + C 38.43"). Zero "Cr"/
+  "CR" occurrences exist anywhere across all three fixtures. The old Cr-suffix detection is kept
+  as a secondary check (harmless, and future-proofs against a card template that does use it) but
+  is no longer the primary signal.
+- The transaction date is usually glued directly to a trailing "|" with no space (e.g.
+  "13/06/2026|"), which the original exact-match date check rejected outright — silently dropping
+  the row. Fixed by stripping a trailing "|" before checking.
 
 How a card differs from the savings parser:
 - No per-row running balance is printed, so there's no balance_after and no balance-delta
   direction signal. reconcile_statement("card_dues", ...) uses the printed aggregates instead and
   skips the row-level walk entirely (that walk only applies when a running balance exists).
-- Direction has exactly ONE source: a trailing "Cr"/"CR" credit indicator on the amount itself.
-  Everything else is a debit (a purchase). There's no second signal to cross-check against, so
-  detecting it is scoped strictly to the amount token's own text — never a substring check against
-  the full line, which would wrongly flag a merchant name containing "cr" (e.g. "SUBSCRIPTION") as
-  a credit. See _split_amount_cell.
-- EMI instalment rows carry markers like "NB:06"/"NBR:01" in the narration. They parse as ordinary
-  debit transactions this increment — no EMI detection/loan linking (that's Phase 2). The markers
-  contain no decimal point, so they never collide with amount-token detection.
+- Direction detection is scoped strictly to the amount cell itself (the "+"/"C"/amount token
+  cluster) — never a substring check against the full line, which would wrongly flag a merchant
+  name containing "cr" (e.g. "SUBSCRIPTION") as a credit. See _find_amount_cell.
+- EMI instalment rows carry markers like "NB:04"/"NBR:04" in the narration (confirmed real,
+  format "OFFUS EMI,PRIN NB:04,00000138588544" / "OFFUS EMI,INT NBR:04,..."). They parse as
+  ordinary debit transactions this increment — no EMI detection/loan linking (Phase 2). The
+  markers contain no decimal point, so they never collide with amount-cell detection.
+- Real transactions are single-line (no multi-line narration wrap was observed) — but the
+  transaction table is directly followed, on the SAME page, by summary sections (transactions
+  total, rewards points, EMI loan summary, GST summary) that print no date and would otherwise be
+  silently appended to the last transaction's narration as a "continuation". _is_section_break
+  flushes the pending transaction there instead of merging it in — this is real, observed
+  pollution, not a hypothetical.
 """
 from __future__ import annotations
 
@@ -41,15 +52,33 @@ from normalize.dates import is_date_token, parse_ddmmyy
 
 _LOGGER = logging.getLogger(__name__)
 
-# Matches an amount cell that may carry BOTH traps at once: a leading "C" currency-glyph
-# substitution (this statement's rendering of ₹) and/or a trailing Cr/CR credit indicator, glued
-# on with no separating space (e.g. "C1,000.00Cr") since that's this bank's PDF-export norm
-# (confirmed on the savings fixture; assumed here too pending the real card PDF).
-_AMOUNT_CANDIDATE_RE = re.compile(r"^C?[\d,]+\.\d{2}(?:\s?(?:Cr|CR))?$")
-_AMOUNT_CELL_RE = re.compile(r"^(C?[\d,]+\.\d{2})(?:\s?(Cr|CR))?$")
+_BARE_AMOUNT_RE = re.compile(r"^[\d,]+\.\d{2}$")
+# Fallback shape (not observed on the real fixtures, kept for robustness): a currency glyph glued
+# directly onto the digits, optionally with a glued Cr/CR suffix, e.g. "C1,000.00" or "C1,000.00Cr".
+_GLUED_AMOUNT_RE = re.compile(r"^C([\d,]+\.\d{2})(Cr|CR)?$")
 _STANDALONE_CR_RE = re.compile(r"^(?:Cr|CR)$")
-DATE_X0_MAX = 70
+_TIME_OF_DAY_RE = re.compile(r"^\d{1,2}:\d{2}$")
+
+# Real dates print glued to a trailing "|" with no space ("13/06/2026|"); occasionally (seen on
+# "International Transactions" rows) there's a real space instead ("21/07/2026 |"), which
+# tokenizes as two separate words and needs no stripping. rstrip handles both uniformly.
+DATE_X0_MAX = 220  # measured: real date tokens sit at x0=169.5; wide margin either side
 LINE_TOP_TOLERANCE = 3
+
+# Section headers that appear on the SAME page directly after the transaction table, before the
+# next page break — confirmed by inspecting all three real fixtures. None of them print a leading
+# date, so without this they'd silently be treated as a continuation of the last transaction's
+# narration (real, observed pollution — this isn't a hypothetical like the savings footer guard).
+_SECTION_BREAK_MARKERS = (
+    "TRANSACTIONS TOTAL AMOUNT",
+    "REWARDS PROGRAM",
+    "SMART EMI LOAN SUMMARY",
+    "GST SUMMARY",
+    "IMPORTANT INFORMATION",
+    "USEFUL LINKS",
+    "DOMESTIC TRANSACTIONS",
+    "INTERNATIONAL TRANSACTIONS",
+)
 
 
 @dataclass
@@ -79,6 +108,14 @@ class _PendingTxn:
     narration_parts: List[str]
 
 
+@dataclass
+class _AmountCell:
+    start: int  # first word index belonging to the cell (narration = words[1:start])
+    end: int  # last word index belonging to the cell (inclusive)
+    magnitude: Decimal
+    is_credit: bool
+
+
 def _cluster_lines(words: List[dict], tolerance: float = LINE_TOP_TOLERANCE) -> List[_Line]:
     boxes = sorted(
         (_Word(w["text"], w["x0"], w["x1"], w["top"]) for w in words),
@@ -97,7 +134,7 @@ def _cluster_lines(words: List[dict], tolerance: float = LINE_TOP_TOLERANCE) -> 
 
 def _is_boilerplate(line_text: str) -> bool:
     upper = line_text.upper()
-    if "HDFC BANK" in upper:
+    if "HDFC BANK" in upper or "CREDIT CARD STATEMENT" in upper:
         return True
     if "DATE" in upper and "TRANSACTION" in upper and ("AMOUNT" in upper or "DESCRIPTION" in upper):
         return True
@@ -106,30 +143,60 @@ def _is_boilerplate(line_text: str) -> bool:
     return False
 
 
-def _split_amount_cell(amount_word: _Word, next_word: Optional[_Word]) -> "tuple[Decimal, TxnDirection]":
-    """Parse one amount token (+ a peek at the next word) into (magnitude, direction).
+def _is_section_break(line_text: str) -> bool:
+    upper = line_text.upper()
+    return any(marker in upper for marker in _SECTION_BREAK_MARKERS)
 
-    Handles both observed shapes for the credit indicator: glued onto the same token
-    ("C1,000.00Cr") or as its own following word ("C1,000.00" then "Cr"). The leading "C" currency
-    glyph is stripped by normalize.amounts.parse_indian_amount regardless of which shape this is.
 
-    Both checks are scoped to this one amount token (+ its immediate neighbour) — never a
-    substring search over the full line — so a merchant name containing "cr" (e.g.
-    "SUBSCRIPTION", "MICROSOFT") can never be mistaken for a credit indicator. Deliberately NOT a
-    `\\bcr\\b` suffix regex on the raw token text: "1,000.00Cr" has no word-boundary between the
-    digit "0" and the letter "C" (both are \\w), so that pattern would silently miss the glued
-    form that's this bank's PDF-export norm — the full-string capture group below matches it
-    directly instead.
+def _find_amount_cell(words: List[_Word]) -> Optional[_AmountCell]:
+    """Find the transaction amount on an anchor line, scanning left to right and taking the LAST
+    complete match (the amount is the rightmost value on the line).
+
+    Primary shape (verified on all three real fixtures): a standalone "+" word (credit only),
+    then a standalone "C" word, then a bare numeric word — "+ C 38.43" or plain "C 23.76".
+    Fallback shape (not observed, kept for robustness): a glued single token "C1,000.00" or
+    "C1,000.00Cr", still honouring a preceding "+" and/or a trailing Cr/CR suffix either way.
     """
-    match = _AMOUNT_CELL_RE.match(amount_word.text)
-    numeric_part = match.group(1) if match else amount_word.text
-    embedded_cr = bool(match and match.group(2))
-    separate_cr = next_word is not None and bool(_STANDALONE_CR_RE.match(next_word.text.strip()))
+    best: Optional[_AmountCell] = None
+    n = len(words)
+    i = 0
+    while i < n:
+        has_plus = words[i].text == "+"
+        j = i + 1 if has_plus else i
+        if j >= n:
+            break
 
-    is_credit = embedded_cr or separate_cr
-    magnitude = parse_indian_amount(numeric_part)
-    direction = TxnDirection.CREDIT if is_credit else TxnDirection.DEBIT
-    return magnitude, direction
+        if words[j].text == "C" and j + 1 < n and _BARE_AMOUNT_RE.match(words[j + 1].text):
+            end = j + 1
+            magnitude = parse_indian_amount(words[end].text)
+            is_credit = has_plus
+            if end + 1 < n and _STANDALONE_CR_RE.match(words[end + 1].text):
+                is_credit = True
+                end += 1
+            best = _AmountCell(start=i, end=end, magnitude=magnitude, is_credit=is_credit)
+            i = end + 1
+            continue
+
+        match = _GLUED_AMOUNT_RE.match(words[j].text)
+        if match:
+            end = j
+            magnitude = parse_indian_amount(match.group(1))
+            is_credit = has_plus or bool(match.group(2))
+            if end + 1 < n and _STANDALONE_CR_RE.match(words[end + 1].text):
+                is_credit = True
+                end += 1
+            best = _AmountCell(start=i, end=end, magnitude=magnitude, is_credit=is_credit)
+            i = end + 1
+            continue
+
+        i += 1
+
+    return best
+
+
+def _clean_narration(words: List[_Word]) -> str:
+    kept = [w.text for w in words if not (w.text == "|" or _TIME_OF_DAY_RE.match(w.text))]
+    return text_clean.clean_text(" ".join(kept))
 
 
 def _finalize(pending: _PendingTxn, source_row: int) -> Transaction:
@@ -173,33 +240,29 @@ def parse(pdf_path: Union[str, Path]) -> List[Transaction]:
                 if not line.words:
                     continue
                 line_text = text_clean.clean_text(line.text)
-                if not line_text or _is_boilerplate(line_text):
+                if not line_text:
+                    continue
+                if _is_section_break(line_text):
+                    _flush()  # summary/rewards/EMI-loan/GST sections end the pending narration
+                    continue
+                if _is_boilerplate(line_text):
                     continue
 
                 first_word = line.words[0]
-                amount_words = [
-                    (i, w) for i, w in enumerate(line.words) if _AMOUNT_CANDIDATE_RE.match(w.text)
-                ]
-                starts_with_date = first_word.x0 < DATE_X0_MAX and is_date_token(first_word.text)
+                date_text = first_word.text.rstrip("|")
+                starts_with_date = first_word.x0 < DATE_X0_MAX and is_date_token(date_text)
+                cell = _find_amount_cell(line.words) if starts_with_date else None
 
-                if starts_with_date and amount_words:
+                if starts_with_date and cell is not None:
                     _flush()
 
-                    amount_index, amount_word = amount_words[-1]
-                    next_word = line.words[amount_index + 1] if amount_index + 1 < len(line.words) else None
-                    magnitude, direction = _split_amount_cell(amount_word, next_word)
-
-                    excluded = {id(first_word), id(amount_word)}
-                    if next_word is not None and _STANDALONE_CR_RE.match(next_word.text.strip()):
-                        excluded.add(id(next_word))
-                    narration_words = [w for w in line.words if id(w) not in excluded]
-
+                    narration_words = line.words[1:cell.start]
                     pending = _PendingTxn(
                         page=page_index,
-                        txn_date=parse_ddmmyy(first_word.text),
-                        direction=direction,
-                        magnitude=magnitude,
-                        narration_parts=[" ".join(w.text for w in narration_words)],
+                        txn_date=parse_ddmmyy(date_text),
+                        direction=TxnDirection.CREDIT if cell.is_credit else TxnDirection.DEBIT,
+                        magnitude=cell.magnitude,
+                        narration_parts=[_clean_narration(narration_words)],
                     )
                 elif pending is not None:
                     pending.narration_parts.append(line_text)
