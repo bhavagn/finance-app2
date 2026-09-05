@@ -12,7 +12,9 @@ import pytest
 from models.enums import TxnDirection
 from parser.templates.hdfc_savings import extract_vpa, parse
 
-FIXTURE = Path(__file__).parent / "fixtures" / "hdfc_savings_9069.pdf"
+_FIXTURES_DIR = Path(__file__).parent / "fixtures"
+_MATCHES = sorted(_FIXTURES_DIR.glob("*9069*.pdf"))
+FIXTURE = _MATCHES[0] if _MATCHES else _FIXTURES_DIR / "hdfc_savings_9069.pdf"
 
 EXPECTED_TXN_COUNT = 549
 EXPECTED_OPENING_BALANCE = Decimal("59828.38")

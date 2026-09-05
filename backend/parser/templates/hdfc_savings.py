@@ -30,12 +30,18 @@ from normalize.dates import is_date_token, parse_ddmmyy
 
 _AMOUNT_TOKEN_RE = re.compile(r"^\d{1,3}(?:,\d{2,3})*\.\d{2}$")
 _BANK_REF_RE = re.compile(r"(?<!\d)\d{16}(?!\d)")
-_VPA_RE = re.compile(r"\b[A-Za-z0-9.\-_]{2,}@[A-Za-z]{2,}\b")
+# No hyphen in the prefix class: UPI narrations use "-" as a field separator (e.g.
+# "UPI-SAFE GOLD-SAFEGOLD@YBL-..."), and an over-greedy class swallows the whole hyphenated
+# run instead of stopping at the real local-part immediately before "@".
+_VPA_RE = re.compile(r"\b[A-Za-z0-9._]{2,}@[A-Za-z]{2,}\b")
 _EMBEDDED_DATE_RE = re.compile(r"\b\d{1,2}/\d{1,2}/\d{2,4}\b")
 
 DATE_X0_MAX = 70
-WITHDRAWAL_X1_RANGE = (400, 442)
-DEPOSIT_X1_RANGE = (470, 512)
+# Right-aligned amount columns have a near-constant x1 regardless of magnitude (measured on the
+# HDFC ••9069 golden fixture: withdrawal values cluster at x1=470.2, deposit at x1=548.2, closing
+# balance at x1=626.7 — a wide margin separates them, so generous tolerance bands are safe).
+WITHDRAWAL_X1_RANGE = (455, 485)
+DEPOSIT_X1_RANGE = (530, 565)
 LINE_TOP_TOLERANCE = 3
 
 
