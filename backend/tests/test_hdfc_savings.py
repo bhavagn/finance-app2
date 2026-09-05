@@ -6,11 +6,13 @@ data), so this test is skipped when it isn't present on disk.
 """
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from models.enums import TxnDirection
+from models.enums import ReconState, TxnDirection
 from parser.templates.hdfc_savings import extract_vpa, parse
+from reconcile import reconcile_statement
 
 _FIXTURES_DIR = Path(__file__).parent / "fixtures"
 _MATCHES = sorted(_FIXTURES_DIR.glob("*9069*.pdf"))
@@ -50,27 +52,26 @@ def test_debit_credit_split(transactions):
     )
 
 
-def test_opening_and_closing_balance(transactions):
-    first, last = transactions[0], transactions[-1]
-    opening = (first.balance_after - first.amount).quantize(Decimal("0.01"))
-    closing = last.balance_after
-
-    assert opening == EXPECTED_OPENING_BALANCE, f"expected opening {EXPECTED_OPENING_BALANCE}, derived {opening}"
+def test_closing_balance(transactions):
+    closing = transactions[-1].balance_after
     assert closing == EXPECTED_CLOSING_BALANCE, f"expected closing {EXPECTED_CLOSING_BALANCE}, got {closing}"
 
 
 def test_statement_level_reconciliation(transactions):
-    first = transactions[0]
-    opening = (first.balance_after - first.amount).quantize(Decimal("0.01"))
-    closing = transactions[-1].balance_after
-
-    credits = sum((t.amount for t in transactions if t.direction is TxnDirection.CREDIT), Decimal("0"))
-    debits = sum((-t.amount for t in transactions if t.direction is TxnDirection.DEBIT), Decimal("0"))
-
-    computed_closing = (opening + credits - debits).quantize(Decimal("0.01"))
-    assert computed_closing == closing, (
-        f"opening {opening} + credits {credits} - debits {debits} = {computed_closing}, expected {closing}"
+    # stmt_meta is duck-typed by reconcile_statement — a plain namespace with the two fields the
+    # running_balance formula needs stands in for a full models.Statement here.
+    stmt_meta = SimpleNamespace(
+        opening_balance=EXPECTED_OPENING_BALANCE,
+        closing_balance=EXPECTED_CLOSING_BALANCE,
     )
+    result = reconcile_statement("running_balance", stmt_meta, transactions)
+
+    assert result.recon_status == ReconState.RECONCILED, (
+        f"expected reconciled, got {result.recon_status} (diff {result.recon_diff}, "
+        f"{len(result.row_mismatches)} row mismatch(es))"
+    )
+    assert result.recon_diff == Decimal("0")
+    assert not result.row_mismatches
 
 
 def test_every_upi_row_has_a_bank_ref(transactions):
