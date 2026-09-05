@@ -19,9 +19,11 @@ class Transaction(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
 
     id: Optional[UUID] = None
-    statement_id: UUID
-    account_id: UUID
-    user_id: UUID
+    # None until the pipeline attaches these FKs after parsing — a parser template only knows the
+    # parsed content of a row, not which statement/account/user it belongs to (see pipeline.py).
+    statement_id: Optional[UUID] = None
+    account_id: Optional[UUID] = None
+    user_id: Optional[UUID] = None
 
     txn_date: date
     posting_date: Optional[date] = None

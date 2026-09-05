@@ -75,9 +75,19 @@ def insert_transactions(transactions: Sequence[Transaction]) -> list[dict]:
 
     Never updates an existing row: re-parsing the same statement relies on the DB's
     (account_id, fingerprint) unique constraint to silently dedupe instead.
+
+    `Transaction.statement_id/account_id/user_id` are optional on the model (a parser template
+    doesn't know them — see models/transaction.py), so unlike the other helpers here this one
+    checks `user_id` at runtime: the pipeline must attach it before calling this.
     """
     if not transactions:
         return []
+    for txn in transactions:
+        if txn.user_id is None or txn.account_id is None or txn.statement_id is None:
+            raise ValueError(
+                "transaction is missing statement_id/account_id/user_id — "
+                "the pipeline must attach these before persisting"
+            )
     payload = [_payload(txn, exclude={"id"}) for txn in transactions]
     resp = get_service_client().table("transactions").insert(payload).execute()
     return resp.data
